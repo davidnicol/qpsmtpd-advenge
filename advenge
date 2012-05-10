@@ -1,0 +1,320 @@
+=head1 NAME
+
+advenge
+
+=head1 DESCRIPTION
+
+the advenge server plugin
+
+=head1 CONFIG
+
+It takes one required parameter, a directory which is to contain the
+configuration DirDB.
+
+  advenge /var/advenge/config
+
+=head1 STATUS
+
+this is a work in progress prototype that may be replaced with an
+envisioned "Perry" per recipient system which will be abstracted
+out of what is done here.
+
+=cut
+
+use DirDB;
+#no warnings;
+
+my %AConfig;
+my %Acache;
+my %Acache2;
+my $CacheFlushCounter = 0;
+
+
+sub register {
+  my ($self, $qp, @args) = @_;
+
+  die "Invalid advenge args: '@args'" unless @args == 1;
+  my $dir = shift @args;
+  warn "advenge config dir [$dir]";
+  die "Invalid advenge args: $dir not a directory" unless -d $dir;
+  $dir =~ m{^([\w/.-]+)$} or die "FUNNY CHARAXCTER IN <$dir>";
+  tie %AConfig, DirDB => "$1";
+  
+}
+
+sub hook_disconnect {
+    my ($self) = @_;
+    return DECLINED;
+
+=head1 TODO: on disconnect
+possibly reverse a transaction that is partially completed, or issue a refund
+=cut
+
+}
+
+sub Advenge::Sender::NewSenderObject {
+	my $PNA = $_[1];
+	$PNA =~ /(\d+\.\d+\.\d+\.\d+)/ or do {
+             warn "NOT SET UP FOR IPv6 (got $PNA)";
+             $_[1] = '999.999.999.999';
+             goto &Advenge::Sender::NewSenderObject;
+        };
+   bless {
+    #RA => $_[2],
+    #PNA => $_[0]->qp->connection->remote_ip
+    ADDRESS => $_[0], PNA =>$1
+  }, 'Advenge::Sender'
+}
+
+sub Advenge::Sender::InvalidSender{
+   my $obj = shift;
+   $obj->{denymessage} = "random failure for testing purposes, please try again";
+   return ( rand(100) < 2)
+}
+
+sub Advenge::Sender::WillPay{
+	my ($obj, $price, $cur) = @_;
+	0 # at this time; FIXME
+};
+
+sub hook_mail {
+    my ($self, $transaction, $address, %param) = @_;
+    
+    my $SenderObj = $self->qp->connection->notes('advenge_sender',Advenge::Sender::NewSenderObject($address->format,$self->qp->connection->remote_ip));
+
+    $self->qp->connection->notes('advenge_rcpts',0);
+    $self->qp->connection->notes('advenge_wl',0);
+    $self->qp->connection->notes('advenge_check_data',0);
+
+    $SenderObj->InvalidSender and return DENYSOFT,$SenderObj->{denymessage};
+
+    return DECLINED;
+}
+    
+sub Advenge::Recipient::NewRecipient {
+	my $address = shift;
+	my $user = $address->user;
+	my $host = $address->host;
+	exists $AConfig{DOMAINS}{$host} or return undef;
+
+	my $PRC = $AConfig{DOMAINS}{$host}{$user} || $AConfig{DOMAINS}{"$host.catchall"};
+	$PRC or return undef;
+
+	bless {
+		PRICE => 99,
+		CURRENCYDESCRIPTION => 'Troy Ounces of Tipjarium',
+		CUR => 'TJ90',
+		user => $user, host => $host, address => "$address",
+		( $PRC =~ /^([A-Z0123456789_.]+)\s*(.*)/gm )
+	}, 'Advenge::Recipient'
+}
+
+our $POBJ;
+sub Advenge::Recipient::PendingAlready{
+	my $obj = shift;
+	my $senderaddress = shift;
+	my $QUAD = shift; # should be an untainted dotted quad.
+	$senderaddress =~ s/<(.+)>/$1/;
+	my ($recipUser, $recipDomain) = @$obj{qw/user host/};
+	for ($recipDomain,$recipUser,$senderaddress){
+                length $_ or die "SHORT";
+		s/([^\w@.-])/join (ord($1),'%','%')/ge;
+	};
+
+	my ($DrecipDomain,$DrecipUser,$Dsenderaddress) = map {
+		/([\w@\-%.]+)/ or die "STRANGENESS";
+		($1); # DETAINTED
+	} ($recipDomain,$recipUser,$senderaddress);
+
+    	$obj->{self}->log(LOGINFO, "checking PENDING {$DrecipDomain}{$DrecipUser}{$Dsenderaddress} via $QUAD");
+
+	my $total = $AConfig{PENDING}{$DrecipDomain}{$DrecipUser}{$Dsenderaddress}{$QUAD}++;
+	$POBJ = $AConfig{PENDING}{$DrecipDomain}{$DrecipUser}{$Dsenderaddress};
+	$total;
+
+}
+
+sub Advenge::Recipient::check_data {
+	my $obj = shift;
+	warn "checking data";
+	return 0;
+
+
+	$obj->{CHECK_DATA} or return 1;
+        # do something with magic phrases
+
+        my $mpsuffix = 1;
+	
+	my $transaction = shift;
+	my @MPs;
+	while($obj->{"MP$mpsuffix"}){
+		push @MPs, qr/$obj->{"MP".$mpsuffix++}/i;
+	};
+	$transaction->body_resetpos;
+	my $lastline = '';
+	my $linecounter = 0;
+	while (defined(my $line = $transaction->body_getline)) {
+		my $this = "$line $lastline";
+		$this =~ s/\s+/ /g;
+		for (@MPs){
+			$this =~ m/$_/ and return 1
+		};
+		$lastline = $line;
+		$linecounter++ > 100 and return 0;
+	};
+
+	return 0;
+};
+our $WLreason;
+sub Advenge::Recipient::whitelistp {
+	my $obj = shift;
+	my $SenderObj = shift;
+
+	$WLreason = "not filtering";
+	exists $obj->{WLFILTER} or return 1;
+
+	$WLreason = "trusted server";
+	exists $obj->{join '-', 'HOST-WL', $SenderObj->{PNA}} and return 1;
+
+	$WLreason = "friends list";
+	exists $obj->{join '-', 'PEER-WL', $SenderObj->{ADDRESS}} and return 1;
+
+	$WLreason = "too expensive";
+	my ($price, $cur) = @$obj{qw/PRICE CUR/};
+	$SenderObj->WillPay($price,$cur) or return 0;
+
+	$WLreason = "insufficient funds";
+	$SenderObj->Debit($price,$cur) or return 0;
+	     $obj->Credit($price,$cur);
+
+	$WLreason = "Paid $price $cur";
+	1;
+};
+sub Advenge::Recipient::forwardto {
+	my $obj = shift;
+	my $f2 = $obj->{FORWARDTO} or return undef;
+
+	# support SPF macros here?
+	$f2 =~ s/%l/$obj->{user}/g;
+	$f2 =~ s/%d/$obj->{host}/g;
+
+	"<$f2>" =~ /<([^<]*)>/ and return $1;
+	die "WEIRDNESS";
+}
+
+sub hook_rcpt {   # FIXME: extend to support payment.
+    my ($self, $transaction, $address, %param) = @_;
+    my $frcpts;
+    ($frcpts=$self->qp->connection->notes('advenge_rcpts')) or $self->qp->connection->notes('advenge_rcpts',$frcpts=[]);
+
+    return (DECLINED) if $self->qp->connection->relay_client();
+
+    my $SenderObj = $self->qp->connection->notes('advenge_sender');
+   
+    my $addr = $address->format;
+    my $RecipObj = Advenge::Recipient::NewRecipient( $address );
+    $RecipObj or return(DENY, "no recipient record for $addr");
+    $RecipObj->{ERROR} and return( DENY,$RecipObj->{ERROR});
+
+    my $f2 = $RecipObj->forwardto;
+    $f2 or return(DENYSOFT, "no forwarding record on file for $address at this time");
+    $self->log(LOGINFO, "if allowed, will forward to  $f2");
+
+    if( $RecipObj->whitelistp($SenderObj)){
+	$self->qp->connection->notes('advenge_wl',1);
+    }else{
+
+	my $message = <<MSG;
+not whitelisted: $WLreason
+++++++++
+only one non-whitelisted recipient is allowed per message, and
+it must be the only recipient.
+++++++++
+You may be able to buy your way on to $RecipObj->{address}'s 
+whitelist however, by funding an advenge account with more
+than $RecipObj->{PRICE} $RecipObj->{CURRENCYDESCRIPTION}
+and setting your advenge.com delivery payment options accordingly.
+++++++++
+It is also possible that the recipient will approve receiving
+messages from $SenderObj->{ADDRESS}
+or (for mailing lists) arriving via $SenderObj->{PNA}
+during the initial new contact period.
+++++++++
+MSG
+	$self->qp->connection->notes('advenge_MSG',$message);
+
+    	if(@$frcpts or $self->qp->connection->notes('advenge_check_data')){
+        	return(DENYSOFT,$message);
+
+    	};
+        
+        $self->qp->connection->notes('advenge_check_data',$RecipObj);
+        $self->qp->connection->notes('advenge_forward_to',$f2);
+        return OK, $message;
+    };
+
+    push @$frcpts, $f2;
+    return OK, $WLreason;
+}
+
+sub hook_data {
+    my ($self, $transaction) = @_;
+    my $RecipObj = $self->qp->connection->notes('advenge_check_data');
+    if (
+        $RecipObj and
+        $RecipObj->{self} = $self and
+        $RecipObj->PendingAlready(
+            $self->qp->connection->notes('advenge_sender')->{ADDRESS},
+            $self->qp->connection->notes('advenge_sender')->{PNA}
+        )
+    ){
+        return DENYSOFT, "recipient has been informed of this sender's presence\n"
+                         . $self->qp->connection->notes('advenge_MSG');
+
+    };
+    $transaction->notes('advenge_PENDINGOBJ',$POBJ);
+    undef $POBJ;
+    DECLINED
+};
+
+sub hook_data_post {
+    my ($self, $transaction) = @_;
+
+    my $frcpts;
+    $frcpts = $self->qp->connection->notes('advenge_rcpts');
+    ref $frcpts or do {
+        $self->log(LOGINFO, "no advenge recipients defined");
+        return DECLINED;
+    };
+
+    $self->log(LOGINFO, "desire forwarding to @$frcpts");
+
+    return (DECLINED) if $self->qp->connection->relay_client();
+
+
+    my $OriginalRecipients = join ' ', map { $_->address } $transaction->recipients;
+    if($self->qp->connection->notes('advenge_check_data') ){
+	chomp(my $FromHeader = $transaction->header->get('From'));
+	chomp(my $SubjectLine = $transaction->header->get('Subject'));
+    	if($self->qp->connection->notes('advenge_check_data')->check_data($transaction)){
+		push @{$frcpts}, $self->qp->connection->notes('advenge_check_data')->forwardto;
+        }else{
+		my $message = $self->qp->connection->notes('advenge_MSG');
+		$transaction->notes('advenge_PENDINGOBJ')->{SUBJECTLINE} = $SubjectLine;
+                return(DENYSOFT, <<POSTMESSAGE)
+++++++
+your message was not automatically approved
+$OriginalRecipients will be apprised that
+$FromHeader is trying to contact them with a subject line
+$SubjectLine
+$message
+POSTMESSAGE
+        }
+    };
+    $transaction->header->add('X-Advenge-Original-Recipients', $OriginalRecipients,0);
+    $transaction->recipients( map { s/<+//; s/>+//; Qpsmtpd::Address->new("<$_>") } @$frcpts);
+    $self->log(LOGINFO, " actually forwarding to @{[$transaction->recipients ]}");
+    
+    return DECLINED;
+}
+
